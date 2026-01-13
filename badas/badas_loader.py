@@ -70,16 +70,15 @@ class BADASModel:
         self.confidence_threshold = confidence_threshold
         self.model = load_badas_model(device=self.device, checkpoint_path=checkpoint_path)
     
-    def predict(self, video_path: str) -> List[float]:
-        """
-        Predict collision probability for each frame window in video.
-        """
-        # On passe directement le chemin (string) au modèle sous-jacent
-        # C'est lui qui gérera le chargement et le sliding window
-        with torch.no_grad():
-            predictions = self.model.predict(video_path)
-        
-        return predictions
+    def predict(self, video_path: str, real_time: bool = False) -> List[float]:
+            """
+            Predict collision probability for each frame window in video.
+            """
+            with torch.no_grad():
+                # Passer le paramètre au modèle VJEPA
+                predictions = self.model.predict(video_path, real_time=real_time)
+            
+            return predictions
     
     def estimate_time_to_accident(self, collision_probs: List[float], 
                                  fps: float = 8.0) -> Optional[float]:

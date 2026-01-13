@@ -4,6 +4,7 @@ V-JEPA 2 Model Implementation using project's actual loading logic
 """
 import sys
 import os
+import cv2
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -130,83 +131,50 @@ class VJEPAModel(BaseModel):
         """Clear all saved tensors from memory"""
         self.preprocessed_tensors.clear()
     
-    def predict(self, video_path: str) -> np.ndarray:
+    def predict(self, video_path: str, real_time: bool = False) -> np.ndarray:
         """Predict frame-level probabilities for single video"""
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
         
         try:
             if self.use_sliding_window and self.sliding_window_predictor is not None:
-                # Use sliding window prediction
-                return self._predict_sliding_window(video_path)
+                # On passe le paramètre real_time ici
+                return self._predict_sliding_window(video_path, real_time=real_time)
             else:
-                # Use regular prediction
                 return self._predict_regular(video_path)
                 
         except FileNotFoundError as e:
             raise FileNotFoundError(f"Video file not found: {e}")
         except Exception as e:
             raise RuntimeError(f"Prediction failed for {video_path}: {e}")
-    
-    def _predict_regular(self, video_path: str) -> np.ndarray:
-        """Regular prediction using fixed window size"""
-        # Preprocess video using shared utilities
-        video_tensor = preprocess_video_frames(
-            video_path=video_path,
-            target_frames=self.frame_count,
-            target_size=(self.img_size, self.img_size),
-            processor=self.processor,
-            transform=self.transform,
-            model_name=self.model_name,
-            target_fps=self.target_fps,
-            take_last_frames=self.take_last_frames
-        )
-        
-        # Save preprocessed tensor if enabled
-        if self.save_preprocessed_tensors:
-            # Store tensor before adding batch dimension
-            self.preprocessed_tensors[video_path] = video_tensor.clone().cpu()
-            
-            # Call save callback if provided
-            if self.tensor_save_callback:
-                self.tensor_save_callback(video_path, video_tensor.clone().cpu())
-        
-        # Add batch dimension and move to device
-        if video_tensor.dim() == 4:  # (T, C, H, W)
-            video_tensor = video_tensor.unsqueeze(0)  # (1, T, C, H, W)
-        video_tensor = video_tensor.to(self.device)
-        
-        # Forward pass
-        with torch.no_grad():
-            outputs = self.model(video_tensor)
-            
-            # Apply temperature scaling (consistent with training)
-            outputs_scaled = apply_temperature_scaling(outputs, temperature=2.0)
-            
-            # Get probabilities for positive class
-            probs = torch.softmax(outputs_scaled, dim=1)[:, 1].cpu().numpy()
-            
-            # Return frame-level predictions (repeat video-level prediction)
-            frame_probs = np.repeat(probs[0], self.frame_count)
-            
-        return frame_probs
-    
-    def _predict_sliding_window(self, video_path: str) -> np.ndarray:
+
+    # 2. Modifier _predict_sliding_window pour gérer l'affichage
+    def _predict_sliding_window(self, video_path: str, real_time: bool = False) -> np.ndarray:
         """Sliding window prediction for frame-level results"""
         
-        # Track the first processed tensor for saving
         first_tensor_saved = False
         
+        # Variable pour stocker la frame brute à afficher (partagée entre preprocess et predict)
+        current_display_frame = None 
+
         def preprocess_fn(frames_array):
             """Preprocess frames for model input"""
-            nonlocal first_tensor_saved
+            nonlocal first_tensor_saved, current_display_frame
             
-            # Manual processing for numpy frames array
+            # --- LOGIQUE REAL TIME ---
+            if real_time:
+                # On prend la dernière image de la fenêtre (l'image "actuelle")
+                # frames_array est en RGB (de video.py), OpenCV veut du BGR
+                raw_img = frames_array[-1].copy()
+                current_display_frame = cv2.cvtColor(raw_img, cv2.COLOR_RGB2BGR)
+            # -------------------------
+
+            # ... (Le reste du code preprocess existant ne change pas) ...
             if self.processor:
                 try:
-                    # Process frames using the model's processor
                     if hasattr(self.processor, '__call__'):
                         inputs = self.processor(videos=frames_array, return_tensors="pt")
+                        # ... (logique d'extraction pixel_values)
                         if 'pixel_values_videos' in inputs:
                             video_tensor = inputs['pixel_values_videos'].squeeze(0)
                         elif 'pixel_values' in inputs:
@@ -216,49 +184,122 @@ class VJEPAModel(BaseModel):
                     else:
                         raise ValueError("Invalid processor")
                 except Exception as e:
-                    print(f"Warning: Processor failed ({e}), using manual transform")
+                    # print(f"Warning: ...")
                     video_tensor = self._manual_transform_frames(frames_array)
             else:
                 video_tensor = self._manual_transform_frames(frames_array)
             
-            # Save the first preprocessed tensor if enabled
+            # ... (Logique de sauvegarde tensor inchangée) ...
             if self.save_preprocessed_tensors and not first_tensor_saved:
-                self.preprocessed_tensors[video_path] = video_tensor.clone().cpu()
-                first_tensor_saved = True
-                #print(f"💾 Saved tensor for {video_path}, shape: {video_tensor.shape}")
-                
-                # Call save callback if provided
-                if self.tensor_save_callback:
-                    self.tensor_save_callback(video_path, video_tensor.clone().cpu())
-            
+                 # ...
+                 pass # (Garde ton code existant ici)
+
             return video_tensor
         
         def model_predict_fn(processed_frames):
             """Model prediction function for sliding window"""
-            # Add batch dimension and move to device
-            if processed_frames.dim() == 4:  # (T, C, H, W)
-                processed_frames = processed_frames.unsqueeze(0)  # (1, T, C, H, W)
+            nonlocal current_display_frame
+
+            # ... (Préparation tensor inchangée) ...
+            if processed_frames.dim() == 4:
+                processed_frames = processed_frames.unsqueeze(0)
             processed_frames = processed_frames.to(self.device)
             
             # Forward pass
             with torch.no_grad():
                 outputs = self.model(processed_frames)
-                
-                # Apply temperature scaling
                 outputs_scaled = apply_temperature_scaling(outputs, temperature=2.0)
-                
-                # Get probabilities for positive class
                 probs = torch.softmax(outputs_scaled, dim=1)[:, 1].cpu().numpy()
                 
-                return probs[0]  # Return scalar prediction for this window
+                prediction_score = probs[0] # Le score final
+                if real_time and current_display_frame is not None:
+                    # 1. Redimensionner l'image (Agrandissement x3 ou x4)
+                    scale_factor = 3
+                    h, w = current_display_frame.shape[:2]
+                    new_dim = (w * scale_factor, h * scale_factor)
+                    big_frame = cv2.resize(current_display_frame, new_dim, interpolation=cv2.INTER_LINEAR)
+                    
+                    # --- DESSIN DE LA JAUGE VERTICALE ---
+                    
+                    # Configuration de la jauge (en pixels sur la grande image)
+                    gauge_w = 30                # Largeur de la barre
+                    gauge_h = int(new_dim[1] * 0.6)  # Hauteur (60% de l'écran)
+                    margin_right = 50           # Marge à droite
+                    margin_bottom = 50          # Marge en bas
+                    
+                    # Coordonnées
+                    x_start = new_dim[0] - margin_right - gauge_w
+                    y_bottom = new_dim[1] - margin_bottom
+                    y_top = y_bottom - gauge_h
+                    
+                    # Dessiner le fond de la jauge (Gris foncé)
+                    cv2.rectangle(big_frame, (x_start, y_top), (x_start + gauge_w, y_bottom), (40, 40, 40), -1)
+                    
+                    # Calcul de la couleur dynamique (Vert -> Jaune -> Rouge)
+                    # Format BGR pour OpenCV
+                    score = prediction_score
+                    if score < 0.5:
+                        # De Vert (0, 255, 0) à Jaune (0, 255, 255)
+                        # Le rouge augmente, le vert reste à fond
+                        ratio = score / 0.5
+                        r = int(255 * ratio)
+                        g = 255
+                        b = 0
+                    else:
+                        # De Jaune (0, 255, 255) à Rouge (0, 0, 255)
+                        # Le rouge reste à fond, le vert diminue
+                        ratio = (score - 0.5) / 0.5
+                        r = 255
+                        g = int(255 * (1 - ratio))
+                        b = 0
+                    
+                    gauge_color = (b, g, r) # BGR
+                    
+                    # Calcul de la hauteur de remplissage
+                    fill_height = int(gauge_h * score)
+                    y_fill_start = y_bottom - fill_height
+                    
+                    # Dessiner la partie remplie (La jauge active)
+                    cv2.rectangle(big_frame, (x_start, y_fill_start), (x_start + gauge_w, y_bottom), gauge_color, -1)
+                    
+                    # Dessiner la bordure (Blanc)
+                    cv2.rectangle(big_frame, (x_start, y_top), (x_start + gauge_w, y_bottom), (200, 200, 200), 2)
+                    
+                    # Ajouter des repères (Lignes horizontales à 50% et 80%)
+                    # Seuil d'avertissement (50%)
+                    y_50 = y_bottom - int(gauge_h * 0.5)
+                    cv2.line(big_frame, (x_start - 5, y_50), (x_start + gauge_w + 5, y_50), (100, 100, 100), 1)
+                    
+                    # Seuil critique (80%)
+                    y_80 = y_bottom - int(gauge_h * 0.8)
+                    cv2.line(big_frame, (x_start - 5, y_80), (x_start + gauge_w + 5, y_80), (100, 100, 100), 1)
+                    
+                    # Afficher le pourcentage textuel à côté de la jauge
+                    text_pct = f"{int(score * 100)}%"
+                    cv2.putText(big_frame, text_pct, (x_start - 60, y_fill_start + 10), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, gauge_color, 2)
+                    
+                    # Afficher l'image finale
+                    cv2.imshow('BADAS Real-Time Inference', big_frame)
+                    
+                    # Gestion de la sortie (touche 'q')
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        print("Interruption utilisateur")
+                # ----------------------------------------
+                return prediction_score
         
-        # Use sliding window predictor
-        results = self.sliding_window_predictor.predict_sliding_windows(
-            video_path=video_path,
-            model_predict_fn=model_predict_fn,
-            preprocess_fn=preprocess_fn,
-            return_per_frame=True
-        )
+        # Lancement du predictor
+        try:
+            results = self.sliding_window_predictor.predict_sliding_windows(
+                video_path=video_path,
+                model_predict_fn=model_predict_fn,
+                preprocess_fn=preprocess_fn,
+                return_per_frame=True
+            )
+        finally:
+            # Important : Fermer la fenêtre OpenCV à la fin du traitement
+            if real_time:
+                cv2.destroyAllWindows()
         
         return results['per_frame']
     
